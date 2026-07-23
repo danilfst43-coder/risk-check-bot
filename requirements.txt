@@ -9,3 +9,5 @@ httpx
 python-telegram-bot
 dadata>=25.10.0
 openai
+gspread
+google-auth
