@@ -43,9 +43,6 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
 user_cooldowns: Dict[int, float] = {}
 COOLDOWN_SECONDS = 3.0
 
-def is_valid_inn(inn: str) -> bool:
-    return inn.isdigit() and len(inn) in (10, 12)
-
 # --- Надежная Логика Поиска по Базе Знаний (RAG) ---
 async def search_via_mcp_agent(question: str) -> Dict[str, str]:
     """
@@ -87,10 +84,18 @@ async def search_via_mcp_agent(question: str) -> Dict[str, str]:
         openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         
         system_prompt = (
-            "Ты — корпоративный ассистент компании. Отвечай на вопрос сотрудника, "
-            "используя ТОЛЬКО предоставленный ниже контекст документов.\n"
-            "Если в контексте нет ответа на вопрос, вежливо скажи, что в регламентах этого нет.\n"
-            "Форматируй ответ четко и структурировано.\n\n"
+            "Ты — умный и вежливый бизнес-ассистент сервиса складского учета СкладПро.\n"
+            "Твоя цель — консультировать потенциальных и текущих клиентов по услугам, тарифам, "
+            "демо-доступу и технической поддержке интеграции с 1С.\n\n"
+            "ПРАВИЛА ОТВЕТА:\n"
+            "1. Отвечай строго на основе предоставленного ниже контекста базы знаний.\n"
+            "2. SKU (Stock Keeping Unit) в тарифной сетке — это уникальные товарные позиции (номенклатура) "
+            "на складе. Умей подробно объяснять, что означает это ограничение в тарифах.\n"
+            "3. Помогай с вопросами по расхождению остатков 1С, регламенту настройки, демо-доступу на 14 дней "
+            "и тарифам (Старт, Стандарт, Бизнес, Корпоративный).\n"
+            "4. Если в контексте действительно нет ответа на вопрос, вежливо скажи, что в регламентах этого нет, "
+            "и предложи перевести диалог на менеджера.\n"
+            "5. Пиши грамотно, структурировано, без лишнего сухой канцелярита.\n\n"
             f"КОНТЕКСТ БАЗЫ ЗНАНИЙ:\n{docs_context}"
         )
 
@@ -104,7 +109,7 @@ async def search_via_mcp_agent(question: str) -> Dict[str, str]:
         )
 
         answer_text = response.choices[0].message.content
-        source_str = ", ".join(sources_found) if sources_found else "База знаний компании"
+        source_str = ", ".join(sources_found) if sources_found else "База знаний СкладПро"
 
         return {
             "question": question,
@@ -117,15 +122,18 @@ async def search_via_mcp_agent(question: str) -> Dict[str, str]:
         return {
             "question": question,
             "answer": f"Произошла ошибка при обращении к нейросети: {e}",
-            "source_document": " Ошибка OpenAI API"
+            "source_document": "Ошибка OpenAI API"
         }
 
 # --- Telegram Бот Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 <b>Привет! Я твой виртуальный ассистент.</b>\n\n"
-        "1️⃣ <b>Проверка контрагентов:</b> Отправь мне <b>ИНН</b> (10 или 12 цифр).\n"
-        "2️⃣ <b>База знаний:</b> Задай любой вопрос по регламентам и документам компании.",
+        "👋 <b>Здравствуйте! Я виртуальный ассистент СкладПро.</b>\n\n"
+        "Я могу ответить на ваши вопросы по:\n"
+        "• Тарифам, стоимости и демо-доступу на 14 дней\n"
+        "• Интеграции с 1С и настройке остатков\n"
+        "• Учёту партий, срокам годности и мобильному приложению\n\n"
+        "Задайте ваш вопрос простыми словами!",
         parse_mode="HTML"
     )
 
@@ -144,38 +152,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cooldowns[user_id] = current_time
     headers = {"X-Internal-Key": INTERNAL_API_KEY}
 
-    # ==========================================
-    # ВЕТКА 1: Проверка ИНН
-    # ==========================================
-    if is_valid_inn(query):
-        await update.message.reply_text(f"🔍 Анализирую запрос по ИНН: <code>{html.escape(query)}</code>...", parse_mode="HTML")
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.get(
-                    f"{API_URL}/api/company/risks",
-                    params={"query": query},
-                    headers=headers
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    reply_text = (
-                        f"🏢 <b>Результат проверки</b>\n\n"
-                        f"📌 <b>Компания:</b> {html.escape(str(data.get('company_name', 'Н/Д')))}\n"
-                        f"🔢 <b>ИНН:</b> <code>{html.escape(str(data.get('inn')))}</code>\n"
-                        f"📊 <b>Уровень риска:</b> {html.escape(str(data.get('risk_label')))}\n"
-                    )
-                    await update.message.reply_text(reply_text, parse_mode="HTML")
-                else:
-                    await update.message.reply_text(f"❌ Ошибка API (код {response.status_code}).")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка связи с сервером: {e}")
-        
-        return
-
-    # ==========================================
-    # ВЕТКА 2: База Знаний
-    # ==========================================
-    await update.message.reply_text(f"📚 Ищу ответ в регламентах: <i>\"{html.escape(query)}\"</i>...", parse_mode="HTML")
+    # База Знаний СкладПро
+    await update.message.reply_text(f"📚 Ищу ответ в базе знаний: <i>\"{html.escape(query)}\"</i>...", parse_mode="HTML")
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
@@ -189,11 +167,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 source = html.escape(data.get("source_document", "Источник не указан"))
 
                 reply_text = (
-                    f"🤖 <b>Ответ из базы знаний:</b>\n\n"
+                    f"🤖 <b>Ответ ассистента:</b>\n\n"
                     f"{answer}\n\n"
                     f"📄 <b>Источник:</b> <code>{source}</code>"
                 )
                 await update.message.reply_text(reply_text, parse_mode="HTML")
+                
             else:
                 await update.message.reply_text(f"❌ Ошибка API знаний (код {response.status_code}).")
     except Exception as e:
@@ -211,7 +190,7 @@ async def lifespan(app: FastAPI):
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
-        print("🤖 Telegram бот с поддержкой Базы Знаний успешно запущен!")
+        print("🤖 Telegram бот СкладПро успешно запущен!")
 
     yield
 
@@ -221,29 +200,15 @@ async def lifespan(app: FastAPI):
         await bot_app.shutdown()
 
 # --- FastAPI App ---
-app = FastAPI(title="Company Risk & Knowledge Base API", lifespan=lifespan)
+app = FastAPI(title="СкладПро AI Support API", lifespan=lifespan)
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Сервис проверки контрагентов и База Знаний работают!"}
-
-@app.get("/api/company/risks", dependencies=[Depends(verify_api_key)])
-def check_company_risks(query: str = Query(..., description="ИНН компании (10 или 12 цифр)")):
-    if not is_valid_inn(query):
-        raise HTTPException(status_code=400, detail="ИНН должен состоять из 10 или 12 цифр")
-
-    return {
-        "query": query,
-        "company_name": "ООО ТЕСТ",
-        "inn": query,
-        "risk_label": "🟢 Низкий риск",
-        "critical_risks": [],
-        "warnings": []
-    }
+    return {"status": "ok", "message": "Сервис СкладПро AI работает!"}
 
 @app.get("/api/knowledge/query", dependencies=[Depends(verify_api_key)])
-async def query_knowledge_base(question: str = Query(..., description="Вопрос по регламентам")):
-    """Эндпоинт обращения к Базе Знаний для поиска по регламентам"""
+async def query_knowledge_base(question: str = Query(..., description="Вопрос по продукту СкладПро")):
+    """Эндпоинт обращения к Базе Знаний для поиска по регламентам СкладПро"""
     result = await search_via_mcp_agent(question)
     return result
 
