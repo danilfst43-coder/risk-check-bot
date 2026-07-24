@@ -1,11 +1,16 @@
 import os
 import time
 import html
+import json
 import asyncio
 from typing import Dict, List
+from datetime import datetime
 from contextlib import asynccontextmanager
+
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Depends
+import gspread
+from google.oauth2.service_account import Credentials
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from telegram import Update
@@ -20,42 +25,91 @@ API_URL = os.getenv("API_URL", "https://my-check-bot.onrender.com").rstrip("/")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# Путь к папке с регламентами и документами
-DOCS_FOLDER_PATH = os.getenv("DOCS_FOLDER_PATH", "./knowledge_docs")
+# Настройки GreenAPI (WhatsApp)
+GREENAPI_INSTANCE_ID = os.getenv("GREENAPI_INSTANCE_ID", "").strip()
+GREENAPI_API_TOKEN = os.getenv("GREENAPI_API_TOKEN", "").strip()
 
-# Создаем папку сразу при запуске скрипта, если её нет
+# Настройки Google Таблиц
+GOOGLE_SHEETS_CREDENTIALS_FILE = os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "credentials.json")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Лиды СкладПро AI")
+
+# Путь к папке с регламентами
+DOCS_FOLDER_PATH = os.getenv("DOCS_FOLDER_PATH", "./knowledge_docs")
 os.makedirs(DOCS_FOLDER_PATH, exist_ok=True)
 
 if not INTERNAL_API_KEY:
     if os.getenv("RENDER"):
-        raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная INTERNAL_API_KEY не задана в Render Environment Variables!")
+        raise ValueError("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная INTERNAL_API_KEY не задана!")
     else:
         INTERNAL_API_KEY = "local_dev_secret_key"
 
-# Настройка защиты API
+# Защита внутренних API
 api_key_header = APIKeyHeader(name="X-Internal-Key", auto_error=False)
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
     if api_key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=403, detail="Доступ запрещен: Неверный или отсутствующий API-ключ")
+        raise HTTPException(status_code=403, detail="Доступ запрещен")
     return api_key
 
-user_cooldowns: Dict[int, float] = {}
+user_cooldowns: Dict[str, float] = {}
 COOLDOWN_SECONDS = 3.0
 
-# --- Надежная Логика Поиска по Базе Знаний (RAG) ---
+# --- Google Таблицы ---
+def add_lead_to_google_sheet(phone: str, request_text: str, status: str = "Новый лид"):
+    """Записывает данные лида в Google Таблицу."""
+    if not os.path.exists(GOOGLE_SHEETS_CREDENTIALS_FILE):
+        print("⚠️ Файл credentials.json не найден. Пропуск записи в Google Таблицу.")
+        return False
+
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([now, phone, request_text, status])
+        print(f"✅ Лид успешно записан в Google Таблицу: {phone}")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка записи в Google Таблицу: {e}")
+        return False
+
+# --- GreenAPI (Отправка в WhatsApp) ---
+async def send_whatsapp_message(chat_id: str, text: str):
+    """Отправляет текстовое сообщение пользователю в WhatsApp через GreenAPI."""
+    if not GREENAPI_INSTANCE_ID or not GREENAPI_API_TOKEN:
+        print("⚠️ GreenAPI не настроен (отсутствует INSTANCE_ID или API_TOKEN).")
+        return
+
+    url = f"https://api.green-api.com/waInstance{GREENAPI_INSTANCE_ID}/sendMessage/{GREENAPI_API_TOKEN}"
+    payload = {
+        "chatId": chat_id,
+        "message": text
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(url, json=payload)
+            if res.status_code == 200:
+                print(f"📤 Сообщение отправлено в WhatsApp [{chat_id}]")
+            else:
+                print(f"❌ Ошибка отправки WhatsApp: {res.status_code} - {res.text}")
+    except Exception as e:
+        print(f"❌ Ошибка связи с GreenAPI: {e}")
+
+# --- Поиск по Базе Знаний (RAG) ---
 async def search_via_mcp_agent(question: str) -> Dict[str, str]:
-    """
-    Сканирует файлы из knowledge_docs и генерирует ответ на основе их содержимого.
-    """
     if not OPENAI_API_KEY:
         return {
             "question": question,
-            "answer": "Ошибка: Переменная OPENAI_API_KEY не задана в окружении (.env).",
-            "source_document": "Конфигурация сервера"
+            "answer": "Ошибка: OPENAI_API_KEY не задан.",
+            "source_document": "Конфигурация"
         }
 
-    # 1. Читаем файлы из папки knowledge_docs
     docs_context = ""
     sources_found = []
 
@@ -70,16 +124,15 @@ async def search_via_mcp_agent(question: str) -> Dict[str, str]:
                             docs_context += f"\n--- ДОКУМЕНТ: {filename} ---\n{content}\n"
                             sources_found.append(filename)
                 except Exception as e:
-                    print(f"Ошибка чтения файла {filename}: {e}")
+                    print(f"Ошибка чтения {filename}: {e}")
 
     if not docs_context:
         return {
             "question": question,
-            "answer": "В базе знаний пока нет загруженных регламентов (папка knowledge_docs пуста или файлы не содержат текст).",
-            "source_document": "Документы не найдены"
+            "answer": "В базе знаний нет загруженных регламентов.",
+            "source_document": "Пусто"
         }
 
-    # 2. Запрос к OpenAI
     try:
         openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         
@@ -89,13 +142,10 @@ async def search_via_mcp_agent(question: str) -> Dict[str, str]:
             "демо-доступу и технической поддержке интеграции с 1С.\n\n"
             "ПРАВИЛА ОТВЕТА:\n"
             "1. Отвечай строго на основе предоставленного ниже контекста базы знаний.\n"
-            "2. SKU (Stock Keeping Unit) в тарифной сетке — это уникальные товарные позиции (номенклатура) "
-            "на складе. Умей подробно объяснять, что означает это ограничение в тарифах.\n"
-            "3. Помогай с вопросами по расхождению остатков 1С, регламенту настройки, демо-доступу на 14 дней "
-            "и тарифам (Старт, Стандарт, Бизнес, Корпоративный).\n"
-            "4. Если в контексте действительно нет ответа на вопрос, вежливо скажи, что в регламентах этого нет, "
-            "и предложи перевести диалог на менеджера.\n"
-            "5. Пиши грамотно, структурировано, без лишнего сухой канцелярита.\n\n"
+            "2. SKU (Stock Keeping Unit) — это уникальные товарные позиции на складе.\n"
+            "3. Если клиент хочет демо-доступ или готов оформить тариф, попроси у него имя и название компании, "
+            "после чего подтверди, что передал заявку менеджеру.\n"
+            "4. Пиши грамотно, структурировано и коротко.\n\n"
             f"КОНТЕКСТ БАЗЫ ЗНАНИЙ:\n{docs_context}"
         )
 
@@ -122,38 +172,29 @@ async def search_via_mcp_agent(question: str) -> Dict[str, str]:
         return {
             "question": question,
             "answer": f"Произошла ошибка при обращении к нейросети: {e}",
-            "source_document": "Ошибка OpenAI API"
+            "source_document": "Ошибка OpenAI"
         }
 
-# --- Telegram Бот Handlers ---
+# --- Telegram Бот Handlers (Интерфейс менеджера/тестирования) ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>Здравствуйте! Я виртуальный ассистент СкладПро.</b>\n\n"
-        "Я могу ответить на ваши вопросы по:\n"
-        "• Тарифам, стоимости и демо-доступу на 14 дней\n"
-        "• Интеграции с 1С и настройке остатков\n"
-        "• Учёту партий, срокам годности и мобильному приложению\n\n"
-        "Задайте ваш вопрос простыми словами!",
+        "Задайте ваш вопрос по тарифам, 1С или демо-доступу!",
         parse_mode="HTML"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
     current_time = time.time()
     query = update.message.text.strip()
 
-    # Защита от спама
-    last_request_time = user_cooldowns.get(user_id, 0)
-    if current_time - last_request_time < COOLDOWN_SECONDS:
-        remaining = int(COOLDOWN_SECONDS - (current_time - last_request_time)) + 1
-        await update.message.reply_text(f"⏳ Пожалуйста, подождите {remaining} сек.")
+    if current_time - user_cooldowns.get(user_id, 0) < COOLDOWN_SECONDS:
+        await update.message.reply_text("⏳ Пожалуйста, подождите пару секунд.")
         return
 
     user_cooldowns[user_id] = current_time
     headers = {"X-Internal-Key": INTERNAL_API_KEY}
 
-    # База Знаний СкладПро
-    await update.message.reply_text(f"📚 Ищу ответ в базе знаний: <i>\"{html.escape(query)}\"</i>...", parse_mode="HTML")
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
@@ -163,20 +204,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if response.status_code == 200:
                 data = response.json()
-                answer = html.escape(data.get("answer", "Не удалось найти ответ."))
-                source = html.escape(data.get("source_document", "Источник не указан"))
+                answer = html.escape(data.get("answer", ""))
+                source = html.escape(data.get("source_document", ""))
 
-                reply_text = (
-                    f"🤖 <b>Ответ ассистента:</b>\n\n"
-                    f"{answer}\n\n"
-                    f"📄 <b>Источник:</b> <code>{source}</code>"
-                )
+                reply_text = f"🤖 <b>Ответ:</b>\n\n{answer}\n\n📄 <b>Источник:</b> <code>{source}</code>"
                 await update.message.reply_text(reply_text, parse_mode="HTML")
-                
             else:
-                await update.message.reply_text(f"❌ Ошибка API знаний (код {response.status_code}).")
+                await update.message.reply_text("❌ Ошибка обработки запроса.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка связи с сервером: {e}")
+        await update.message.reply_text(f"❌ Ошибка связи: {e}")
 
 # --- Lifespan ---
 @asynccontextmanager
@@ -190,7 +226,7 @@ async def lifespan(app: FastAPI):
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
-        print("🤖 Telegram бот СкладПро успешно запущен!")
+        print("🤖 Telegram бот запущен!")
 
     yield
 
@@ -208,11 +244,50 @@ def read_root():
 
 @app.get("/api/knowledge/query", dependencies=[Depends(verify_api_key)])
 async def query_knowledge_base(question: str = Query(..., description="Вопрос по продукту СкладПро")):
-    """Эндпоинт обращения к Базе Знаний для поиска по регламентам СкладПро"""
     result = await search_via_mcp_agent(question)
     return result
 
-# Точка входа для локального запуска
+# --- Webhook для GreenAPI (WhatsApp) ---
+@app.post("/api/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    """Принимает входящие сообщения из WhatsApp от GreenAPI."""
+    try:
+        payload = await request.json()
+        type_webhook = payload.get("typeWebhook")
+
+        # Проверяем, что это входящее сообщение от клиента
+        if type_webhook == "incomingMessageReceived":
+            message_data = payload.get("messageData", {})
+            sender_data = payload.get("senderData", {})
+
+            chat_id = sender_data.get("chatId")  # Например: "79991112233@c.us"
+            phone = sender_data.get("sender", "").replace("@c.us", "")
+            text_message = message_data.get("textMessageData", {}).get("textMessage", "").strip()
+
+            if chat_id and text_message:
+                print(f"📩 Входящее сообщение WhatsApp от {phone}: {text_message}")
+
+                # 1. Запрос к AI
+                ai_result = await search_via_mcp_agent(text_message)
+                answer_text = ai_result.get("answer", "")
+
+                # 2. Отправка ответа в WhatsApp
+                await send_whatsapp_message(chat_id, answer_text)
+
+                # 3. Если в запросе или ответе есть ключевые слова лида — фиксируем в Google Таблицу
+                keywords = ["демо", "тарифа", "подключить", "купить", "стоимость", "демонстрация", "тест"]
+                if any(kw in text_message.lower() for kw in keywords):
+                    add_lead_to_google_sheet(
+                        phone=phone,
+                        request_text=text_message,
+                        status="Запрос демо / тарифа"
+                    )
+
+    except Exception as e:
+        print(f"❌ Ошибка при обработке WhatsApp Webhook: {e}")
+
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)
