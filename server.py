@@ -54,19 +54,29 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
 user_cooldowns: Dict[str, float] = {}
 COOLDOWN_SECONDS = 3.0
 
-# --- Google Таблицы ---
-def add_lead_to_google_sheet(phone: str, request_text: str, status: str = "Новый лид"):
-    """Записывает данные лида в Google Таблицу."""
-    if not os.path.exists(GOOGLE_SHEETS_CREDENTIALS_FILE):
-        print("⚠️ Файл credentials.json не найден. Пропуск записи в Google Таблицу.")
-        return False
+import json
 
+def add_lead_to_google_sheet(phone: str, request_text: str, status: str = "Новый лид"):
+    # 1. Сначала пробуем прочитать из переменной Render
+    google_json_str = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    
     try:
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
-        creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=scopes)
+        
+        if google_json_str:
+            # Авторизация из строки (для Render)
+            creds_dict = json.loads(google_json_str)
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        elif os.path.exists(GOOGLE_SHEETS_CREDENTIALS_FILE):
+            # Авторизация из файла (для локальной разработки)
+            creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=scopes)
+        else:
+            print("⚠️ Ключи Google Таблиц не найдены ни в .env, ни в файле.")
+            return False
+
         client = gspread.authorize(creds)
         sheet = client.open(GOOGLE_SHEET_NAME).sheet1
         
